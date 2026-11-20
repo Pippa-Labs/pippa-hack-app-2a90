@@ -28,13 +28,13 @@ outcomes:
   - id: outfit.suggest
     summary: Suggest an outfit for the live weather in a place, optionally from clothes the person owns
     example_phrases:
-      - what should I wear
-      - do I need a coat
-      - do I need an umbrella
-      - should I bring a jacket
-      - what should I wear from my wardrobe
+      - what should i wear
+      - do i need a coat
+      - do i need an umbrella
+      - should i bring a jacket
+      - what should i wear from my wardrobe
       - is it shorts weather
-      - which of my clothes should I wear
+      - which of my clothes should i wear
       - is it cold enough for a jumper
     inputs:
       - name: place
