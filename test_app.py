@@ -1,156 +1,139 @@
-"""Tests for your app. Run them with `pytest`.
-
-Keep these. Publishing runs them, and a repository whose tests fail does not
-deploy — which is the fastest feedback you will get all day, because the
-alternative is finding out from a user that your app answers wrongly.
-
-`LocalRunner` is the same code the production runtime uses to call your app.
-So a call that works here works deployed, and — more usefully — a `Result`
-that violates your manifest fails here exactly as it would in production.
-That is the whole reason to test through the runner rather than calling
-`App().handle(...)` directly.
-"""
+"""Tests for What to Wear. The network is stubbed: `_fetch` is replaced."""
 
 from __future__ import annotations
 
+import json
+import urllib.error
 from datetime import datetime, timezone
 
 import pytest
-from pippa_agentapp_sdk import LocalRunner, OutputShapeViolation
+from pippa_agentapp_sdk import LocalRunner, ServiceUnavailableError
 
-from app import App, CannotReadDate
+from app import App, PlaceNotFound
 
-# A fixed "now", so a test that passes today still passes next March.
-# 21:00 UTC on purpose: it is already the next day in New Zealand, which is
-# what makes the time zone test below mean anything. At 09:00 UTC it is still
-# the same day everywhere that matters, and the test would pass whether or not
-# the code handled time zones at all.
-NOW = datetime(2026, 10, 22, 21, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 11, 20, 15, 0, tzinfo=timezone.utc)
+
+GEO_LONDON = {
+    "results": [{"name": "London", "latitude": 51.50853, "longitude": -0.12574,
+                 "country": "United Kingdom", "timezone": "Europe/London"}],
+    "generationtime_ms": 0.12,
+}
+GEO_NOTHING = {"generationtime_ms": 0.05}   # what Open-Meteo really sends
 
 
-def call(inputs: dict, outcome: str = "days.until", *, explicit: bool = False):
-    """Run one outcome the way the runtime does, and return the Result.
+def forecast(feels: float, wind: float, chances: list) -> dict:
+    return {
+        "timezone": "Europe/London",
+        "current": {"time": "2026-11-20T15:00", "interval": 900,
+                    "temperature_2m": feels + 2, "apparent_temperature": feels,
+                    "precipitation": 0.0, "wind_speed_10m": wind},
+        "hourly": {"time": [f"2026-11-20T{h:02d}:00" for h in range(len(chances))],
+                   "precipitation_probability": chances},
+    }
 
-    `granted_secrets` is required even though a hackathon app never has any —
-    the runner takes it on every call, so an empty dict is how you say "none".
 
-    `explicit=True` calls the app the way Pippa does when the person picked
-    it by name (`@Days Until ...`) instead of Pippa choosing it. The app sees
-    it as `call.context.explicit`.
-    """
-    return LocalRunner(App()).call(
-        outcome, inputs, granted_secrets={}, now=NOW, request_id="test-1",
-        explicit=explicit,
+def make_app(geo: dict, weather: dict | None = None) -> App:
+    app = App()
+    seen: list[str] = []
+
+    def fake_fetch(url, timeout=5.0):
+        seen.append(url)
+        if "geocoding-api" in url:
+            return json.dumps(geo).encode()
+        return json.dumps(weather).encode()
+
+    app._fetch = fake_fetch
+    app.seen_urls = seen
+    return app
+
+
+def run(app: App, inputs: dict, *, explicit: bool = False):
+    return LocalRunner(app).call(
+        "outfit.suggest", inputs, granted_secrets={}, now=NOW,
+        request_id="t1", explicit=explicit,
     ).result
 
 
+COLD_WET = forecast(feels=3.2, wind=12, chances=[20, 70, 55, None, 10])
+WARM_DRY = forecast(feels=22.4, wind=8, chances=[0, 5, 10])
+
+
 def test_the_manifest_is_valid():
-    """The first thing to break, and the easiest to miss.
-
-    `App()` validates manifest.yaml as it is constructed, so this fails the
-    moment the manifest is malformed — before anything else has a chance to
-    produce a more confusing error.
-    """
     app = App()
-    assert app.manifest.app_id.startswith("hack.")
-    assert [o.id for o in app.manifest.outcomes] == ["days.until"]
+    assert [o.id for o in app.manifest.outcomes] == ["outfit.suggest"]
 
 
-def test_it_counts_the_days():
-    result = call({"date": "2026-12-25"})
-    assert result.data["days"] == 64
-    assert result.data["target_date"] == "2026-12-25"
-    assert result.data["weekday"] == "Friday"
-    assert result.data["already_passed"] is False
+def test_cold_and_wet_returns_a_coat_and_an_umbrella():
+    result = run(make_app(GEO_LONDON, COLD_WET), {"place": "London"})
+    data = result.data
+    assert data["place_used"] == "London, United Kingdom"
+    assert data["feels_like_c"] == 3
+    assert data["rain_chance_percent"] == 70
+    assert data["wind_kmh"] == 12
+    assert data["outfit"][0] == "heavy coat"
+    assert any("umbrella" in item for item in data["outfit"])
+    assert "closed shoes" in data["outfit"]
+    assert "umbrella" in result.narrative
 
 
-def test_a_date_written_in_words_works():
-    result = call({"date": "25 December"})
-    assert result.data["target_date"] == "2026-12-25"
+def test_warm_and_dry_returns_a_t_shirt_and_no_umbrella():
+    data = run(make_app(GEO_LONDON, WARM_DRY), {"place": "London"}).data
+    assert data["outfit"] == ["t-shirt"]
+    assert not any("umbrella" in item for item in data["outfit"])
 
 
-def test_a_date_already_gone_rolls_to_next_year():
-    """`1 January` asked in October means the January that is coming."""
-    result = call({"date": "1 January"})
-    assert result.data["target_date"] == "2027-01-01"
-    assert result.data["already_passed"] is False
+def test_wardrobe_in_cold_rain_picks_puffer_and_raincoat_not_shorts():
+    data = run(make_app(GEO_LONDON, COLD_WET),
+               {"place": "London", "wardrobe": ["puffer", "raincoat", "shorts"]}).data
+    assert data["from_your_wardrobe"] == ["puffer", "raincoat"]
 
 
-def test_the_users_timezone_decides_what_today_is():
-    """21:00 UTC is already tomorrow in Auckland.
-
-    Worth a test of its own: it is the bug every date app has, it only shows
-    up for users in some parts of the world, and it is invisible if you only
-    ever test from one place.
-    """
-    here = call({"date": "2026-10-23"}).data["days"]
-    there = call({"date": "2026-10-23", "timezone": "Pacific/Auckland"}).data["days"]
-    assert here == 1    # still the 22nd in UTC
-    assert there == 0   # already the 23rd in Auckland
+def test_no_wardrobe_returns_an_empty_list():
+    data = run(make_app(GEO_LONDON, COLD_WET), {"place": "London"}).data
+    assert data["from_your_wardrobe"] == []
 
 
-def test_a_made_up_timezone_never_reaches_the_app():
-    """The platform checks declared types before your code runs.
-
-    `type: timezone` in the manifest means the runtime validates it. So your
-    app does not need to — and should not, because a hand-rolled check here
-    would be dead code that looks load-bearing.
-    """
-    from pippa_agentapp_sdk import InputShapeViolation
-
-    with pytest.raises(InputShapeViolation):
-        call({"date": "2026-12-25", "timezone": "Mars/Olympus"})
+def test_strong_wind_says_umbrella_will_struggle():
+    windy = forecast(feels=8, wind=45, chances=[80])
+    result = run(make_app(GEO_LONDON, windy), {"place": "London"})
+    assert "windproof layer" in result.data["outfit"]
+    assert "waterproof jacket" in result.data["outfit"]
+    assert "struggle" in result.narrative
 
 
-def test_no_date_is_an_error_a_user_can_read():
-    with pytest.raises(CannotReadDate) as failure:
-        call({"date": ""})
-    # `user_message` is the only part a user may be shown, so it is the part
-    # worth asserting on. The rest stays in the logs.
-    assert failure.value.user_message == "I could not work out which date you meant."
+def test_no_place_defaults_to_london():
+    app = make_app(GEO_LONDON, WARM_DRY)
+    run(app, {"place": ""})
+    assert "name=London" in app.seen_urls[0]
 
 
-def test_nonsense_is_refused_rather_than_guessed():
-    with pytest.raises(CannotReadDate):
-        call({"date": "a week on Thursday-ish"})
+def test_place_with_a_space_is_encoded():
+    app = make_app(GEO_LONDON, WARM_DRY)
+    run(app, {"place": "New York"})
+    assert "name=New+York" in app.seen_urls[0]
 
 
-def test_picked_by_name_it_answers_and_refuses_as_usual():
-    """`@Days Until ...` in the chat: the person picked this app themselves.
-
-    Then nothing checks whether the message suits the app. It is called
-    whatever the words, and `call.context.explicit` is True. The right
-    response is the ordinary one: answer what you can, and refuse only for a
-    missing or unreadable input, with a sentence that says what was wrong.
-    Never refuse because the message does not look like your example phrases
-    — the person has already told you it is for you.
-
-    This app never reads the flag, because it never needed to: it already
-    refuses only for a missing or unreadable date. If yours does, read it as
-    `getattr(call.context, "explicit", False)`. An app published before the
-    platform update that added the flag runs on an SDK that does not have
-    it, until you publish it again.
-    """
-    picked = call({"date": "2026-12-25"}, explicit=True)
-    assert picked.data == call({"date": "2026-12-25"}).data
-
-    with pytest.raises(CannotReadDate) as failure:
-        call({"date": ""}, explicit=True)
-    assert failure.value.user_message == "I could not work out which date you meant."
+def test_unknown_place_names_it():
+    with pytest.raises(PlaceNotFound) as failure:
+        run(make_app(GEO_NOTHING), {"place": "Narnia"})
+    assert "Narnia" in failure.value.user_message
 
 
-def test_the_runner_enforces_the_manifest(monkeypatch):
-    """Proof that the contract is real, and the reason to test through it.
+def test_unknown_place_is_refused_when_picked_by_name_too():
+    with pytest.raises(PlaceNotFound):
+        run(make_app(GEO_NOTHING), {"place": "Narnia"}, explicit=True)
 
-    An app returning a field it did not declare is refused. You will meet this
-    error if you add something to `data` and forget to add it to `output` in
-    manifest.yaml — which is the single most common way a first app fails
-    after it deploys.
-    """
-    from pippa_agentapp_sdk import Result
 
-    monkeypatch.setattr(
-        App, "handle", lambda self, c: Result(data={"surprise": "hello"})
-    )
-    with pytest.raises(OutputShapeViolation):
-        call({"date": "2026-12-25"})
+@pytest.mark.parametrize("problem", [
+    TimeoutError("timed out"),
+    urllib.error.URLError("unreachable"),
+])
+def test_fetch_failing_returns_the_service_error(problem):
+    app = App()
+
+    def broken(url, timeout=5.0):
+        raise problem
+
+    app._fetch = broken
+    with pytest.raises(ServiceUnavailableError):
+        run(app, {"place": "London"})

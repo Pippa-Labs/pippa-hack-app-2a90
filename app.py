@@ -1,178 +1,239 @@
-"""Your app. Replace this with whatever you are building.
+"""What to Wear: live weather for a place, turned into an outfit.
 
-The shape never changes, whatever your app does:
+Two requests to Open-Meteo (no key needed):
 
-    class App:
-        manifest  -> the parsed manifest.yaml sitting next to this file
-        handle(call) -> Result
+1. geocoding — place name -> coordinates
+2. forecast  — current feels-like temperature and wind, plus the hourly
+   chance of rain for the next 12 hours
 
-`handle` is called once per request and must return a `Result` whose `data`
-matches the `output` your manifest declares for that outcome — exactly: every
-declared field present, nothing extra, right types. The runtime checks it and
-refuses anything that does not match, which is deliberate. An app that can
-return surprise fields is an app Pippa cannot describe to a user before they
-install it.
-
-Three things worth knowing before you start:
-
-**You get the inputs, and nothing about who asked.** No user id, no account,
-no conversation. `call.inputs` is what Pippa extracted from the message;
-besides it, `call.context` carries only the time, an id for your logs, and
-whether the person picked your app by name. This is on purpose: your app
-cannot leak what it was never given.
-
-**You keep nothing.** A fresh copy of this class is built for every call and
-thrown away afterwards. Writing to a file or a global will appear to work and
-then silently stop, because the next call may be on a different machine.
-
-**Errors are part of the design.** Raise `AgentAppError` with a `user_message`
-when you cannot answer. That message is the one a user may see; everything
-else — the exception type, the traceback — stays in the logs.
+Then a few fixed rules turn the weather into clothes, and, if the person
+listed what they own, pick the items from their list that suit it.
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+import json
+import urllib.error
+import urllib.request
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
 
 from pippa_agentapp_sdk import (
     AgentAppError,
     Call,
     Manifest,
+    RateLimitedError,
     Result,
+    ServiceUnavailableError,
     load_manifest_file,
     validate_manifest,
 )
 
 MANIFEST_PATH = Path(__file__).with_name("manifest.yaml")
 
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+USER_AGENT = "pippa-agent-app-what-to-wear/0.1 (https://github.com/Pippa-Labs)"
+TIMEOUT_SECONDS = 5.0
+DEFAULT_PLACE = "London"
 
-class CannotReadDate(AgentAppError):
-    """Raised when the message did not contain a date we can work with."""
+RAIN_THRESHOLD = 40   # percent: at or above this, plan for rain
+WIND_THRESHOLD = 30   # km/h: above this, plan for wind
 
-    # What a user may be shown. Write it as a sentence, not an error code.
-    user_message = "I could not work out which date you meant."
+# Keyword -> group. Checked in this order, so "raincoat" is waterproof before
+# "coat" can make it warm, and "rain jacket" is waterproof before "jacket".
+WARDROBE_GROUPS: list[tuple[str, tuple[str, ...]]] = [
+    ("waterproof", ("raincoat", "waterproof", "umbrella", "rain", "cagoule")),
+    ("footwear", ("boots", "trainers", "sneakers", "wellies")),
+    ("warm", ("sweatshirt", "coat", "puffer", "parka", "jumper", "sweater", "hoodie",
+              "fleece", "jacket", "cardigan", "jeans", "gloves", "scarf")),
+    ("light", ("t-shirt", "tshirt", "tee", "shirt", "shorts", "sandals")),
+]
+
+
+class PlaceNotFound(AgentAppError):
+    user_message = "I could not find that place."
     retryable = False
 
 
 class App:
-    """A small, complete example: count the days until a date."""
-
     def __init__(self) -> None:
-        # Validated at construction, so an app whose manifest is wrong fails
-        # immediately and loudly rather than on some later call.
         self._manifest = validate_manifest(load_manifest_file(MANIFEST_PATH))
 
     @property
     def manifest(self) -> Manifest:
         return self._manifest
 
-    def handle(self, call: Call) -> Result:
-        """One request in, one Result out.
+    # ── The one network seam. Tests replace this on the instance. ──────────
+    def _fetch(self, url: str, timeout: float = TIMEOUT_SECONDS) -> bytes:
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
 
-        `call.outcome_id` says which of your manifest's outcomes was asked
-        for. With one outcome you can ignore it; with several, branch on it.
-        """
-        if call.outcome_id != "days.until":
+    def handle(self, call: Call) -> Result:
+        if call.outcome_id != "outfit.suggest":
             raise AgentAppError(f"this app cannot do {call.outcome_id!r}")
 
-        text = (call.inputs.get("date") or "").strip()
-        if not text:
-            # The manifest tells the extractor to send an empty string rather
-            # than guess, so this is the ordinary "they did not say" path.
-            #
-            # A missing or unreadable date (here, and in `_parse` below) is
-            # the only thing this app refuses for, which is why it never reads
-            # `call.context.explicit`, True when the person picked the app
-            # with @. That refusal is right whoever chose the app; the test
-            # that says so is in test_app.py.
-            raise CannotReadDate("no date in the message")
+        place = (call.inputs.get("place") or "").strip() or DEFAULT_PLACE
+        wardrobe = [str(item).strip() for item in (call.inputs.get("wardrobe") or [])
+                    if str(item).strip()]
 
-        # `call.context.now` is the current time, supplied by the runtime
-        # rather than read from the clock. That is what makes an app testable:
-        # a test can say what "now" is.
-        today = self._today(call)
-        target = self._parse(text, today)
-        difference = (target - today).days
+        name, country, lat, lon = self._locate(place)
+        feels, rain, wind = self._weather(lat, lon)
+
+        outfit = self._outfit(feels, rain, wind)
+        picked = self._from_wardrobe(wardrobe, feels, rain)
+        place_used = f"{name}, {country}" if country else name
 
         return Result(
             data={
-                "days": abs(difference),
-                "target_date": target.isoformat(),
-                "weekday": target.strftime("%A"),
-                "already_passed": difference < 0,
+                "place_used": place_used,
+                "feels_like_c": feels,
+                "rain_chance_percent": rain,
+                "wind_kmh": wind,
+                "outfit": outfit,
+                "from_your_wardrobe": picked,
             },
-            # Optional. One plain sentence Pippa may use when it writes its
-            # reply. Say what you found, not what you did.
-            narrative=self._sentence(target, difference),
+            narrative=self._sentence(name, feels, rain, wind, picked),
         )
 
+    # ── Network ─────────────────────────────────────────────────────────────
+    def _get_json(self, url: str, what: str) -> dict:
+        try:
+            raw = self._fetch(url, timeout=TIMEOUT_SECONDS)
+        except urllib.error.HTTPError as exc:          # must come before URLError
+            if exc.code == 429:
+                raise RateLimitedError(f"{what} rate limited")
+            raise ServiceUnavailableError(f"{what} returned HTTP {exc.code}")
+        except TimeoutError as exc:                    # not a URLError
+            raise ServiceUnavailableError(f"{what} timed out: {exc}")
+        except urllib.error.URLError as exc:
+            raise ServiceUnavailableError(f"could not reach {what}: {exc.reason}")
+        except OSError as exc:
+            raise ServiceUnavailableError(f"{what} connection failed: {exc}")
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            raise ServiceUnavailableError(f"{what} sent something that is not JSON")
+        if not isinstance(data, dict):
+            raise ServiceUnavailableError(f"{what} sent an unexpected shape")
+        return data
+
+    def _locate(self, place: str) -> tuple[str, str, float, float]:
+        url = GEOCODE_URL + "?" + urlencode(
+            {"name": place, "count": 1, "language": "en", "format": "json"})
+        data = self._get_json(url, "geocoding")
+        results = data.get("results") or []   # unknown place: 200, no "results"
+        if not results:
+            error = PlaceNotFound(f"no geocoding result for {place!r}")
+            error.user_message = f"I could not find anywhere called {place}."
+            raise error
+        top = results[0]
+        try:
+            return (str(top.get("name") or place), str(top.get("country") or ""),
+                    float(top["latitude"]), float(top["longitude"]))
+        except (KeyError, TypeError, ValueError):
+            raise ServiceUnavailableError("geocoding result had no coordinates")
+
+    def _weather(self, lat: float, lon: float) -> tuple[int, int, int]:
+        url = FORECAST_URL + "?" + urlencode({
+            "latitude": lat,
+            "longitude": lon,
+            "current": "temperature_2m,apparent_temperature,precipitation,wind_speed_10m",
+            "hourly": "precipitation_probability",
+            "forecast_hours": 12,
+            "timezone": "auto",
+        })
+        data = self._get_json(url, "forecast")
+        current = data.get("current") or {}
+        feels = current.get("apparent_temperature")
+        if feels is None:
+            feels = current.get("temperature_2m")
+        wind = current.get("wind_speed_10m")
+        if feels is None or wind is None:
+            raise ServiceUnavailableError("forecast had no current conditions")
+        chances = [p for p in (data.get("hourly") or {}).get("precipitation_probability") or []
+                   if isinstance(p, (int, float))]
+        rain = max(chances) if chances else 0
+        return round(feels), round(rain), round(wind)
+
+    # ── Rules ───────────────────────────────────────────────────────────────
     @staticmethod
-    def _today(call: Call) -> date:
-        """The user's today, not the server's.
+    def _outfit(feels: int, rain: int, wind: int) -> list[str]:
+        if feels < 5:
+            outfit = ["heavy coat", "jumper", "gloves"]
+        elif feels < 12:
+            outfit = ["coat", "jumper"]
+        elif feels <= 18:
+            outfit = ["light jacket"]
+        elif feels <= 25:
+            outfit = ["t-shirt"]
+        else:
+            outfit = ["t-shirt", "shorts"]
 
-        A server in UTC and a user in Auckland disagree about what day it is
-        for twelve hours out of every twenty-four, and "how many days until"
-        is exactly the question that notices.
-        """
-        # No try/except around ZoneInfo, and that is the point: the manifest
-        # declares this input as `type: timezone`, so the runtime has already
-        # rejected anything that is not a real IANA zone before your code
-        # runs. Declaring the right type is cheaper than validating by hand,
-        # and the user gets a better error.
-        zone = call.inputs.get("timezone")
-        moment: datetime = call.context.now
-        if zone:
-            moment = moment.astimezone(ZoneInfo(zone))
-        return moment.date()
+        windy = wind > WIND_THRESHOLD
+        if rain >= RAIN_THRESHOLD:
+            # An umbrella is little use in strong wind, so only offer it when calm.
+            outfit.insert(1, "waterproof jacket" if windy else "waterproof jacket or umbrella")
+            outfit.append("closed shoes")
+        if windy:
+            outfit.append("windproof layer")
+        return outfit
 
     @staticmethod
-    def _parse(text: str, today: date) -> date:
-        """Turn what the user wrote into a date.
+    def _group(item: str) -> str | None:
+        text = item.lower()
+        for group, keywords in WARDROBE_GROUPS:
+            if any(keyword in text for keyword in keywords):
+                return group
+        return None
 
-        Deliberately small — real date parsing is its own project. Handles
-        `YYYY-MM-DD`, `25 December`, `December 25` and a bare day number.
-        """
-        cleaned = text.replace(",", " ").strip()
+    @classmethod
+    def _from_wardrobe(cls, wardrobe: list[str], feels: int, rain: int) -> list[str]:
+        wet = rain >= RAIN_THRESHOLD
+        wanted = {"footwear"}
+        wanted.add("warm" if feels <= 18 else "light")
+        if wet:
+            wanted.add("waterproof")
 
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-            try:
-                return datetime.strptime(cleaned, fmt).date()
-            except ValueError:
+        picked: list[str] = []
+        for item in wardrobe:
+            group = cls._group(item)
+            if group not in wanted:
                 continue
-
-        for fmt in ("%d %B", "%B %d", "%d %b", "%b %d"):
-            try:
-                parsed = datetime.strptime(cleaned, fmt).date()
-            except ValueError:
-                continue
-            # A bare day and month has no year. "25 December" asked in
-            # February means this year; asked in December means this year too,
-            # until it has passed, and then it means next year.
-            candidate = parsed.replace(year=today.year)
-            if candidate < today:
-                candidate = candidate.replace(year=today.year + 1)
-            return candidate
-
-        if cleaned.lower() == "tomorrow":
-            return today + timedelta(days=1)
-
-        raise CannotReadDate(f"could not parse {text!r} as a date")
+            if wet and "sandal" in item.lower():
+                continue   # rain calls for closed shoes
+            if feels <= 25 and "shorts" in item.lower():
+                continue   # shorts only once it is properly warm
+            if item not in picked:
+                picked.append(item)
+        return picked
 
     @staticmethod
-    def _sentence(target: date, difference: int) -> str:
-        # Built by hand rather than with `%-d`, which is a GNU extension: it
-        # raises ValueError on Windows, where half of you are developing, and
-        # the failure would only show up at the last line of a working app.
-        pretty = (
-            f"{target.strftime('%A')} {target.day} "
-            f"{target.strftime('%B')} {target.year}"
-        )
-        if difference == 0:
-            return f"That is today, {pretty}."
-        if difference < 0:
-            return f"{pretty} was {abs(difference)} days ago."
-        if difference == 1:
-            return f"{pretty} is tomorrow."
-        return f"There are {difference} days until {pretty}."
+    def _sentence(name: str, feels: int, rain: int, wind: int, picked: list[str]) -> str:
+        if feels < 5:
+            wear = "a heavy coat, a jumper and gloves"
+        elif feels < 12:
+            wear = "a coat"
+        elif feels <= 18:
+            wear = "a light jacket"
+        elif feels <= 25:
+            wear = "a t-shirt"
+        else:
+            wear = "a t-shirt and shorts"
+
+        windy = wind > WIND_THRESHOLD
+        extra = ""
+        if rain >= RAIN_THRESHOLD and windy:
+            extra = (f" and a waterproof jacket, since an umbrella will struggle "
+                     f"in {wind} km/h wind")
+        elif rain >= RAIN_THRESHOLD:
+            extra = " and take an umbrella"
+        elif windy:
+            extra = f" with a windproof layer for the {wind} km/h wind"
+
+        sentence = (f"It feels like {feels}°C in {name} with a {rain}% chance of rain, "
+                    f"so wear {wear}{extra}")
+        if picked:
+            sentence += f"; from your clothes, go for {', '.join(picked)}"
+        return sentence + "."
