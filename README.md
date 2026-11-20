@@ -1,3 +1,12 @@
+# What to Wear
+
+By [github.com/chakshu-c](https://github.com/chakshu-c) and [github.com/arnavpopley](https://github.com/arnavpopley)
+
+A Pippa app that checks the live weather for your place and tells you what to
+wear, choosing from your own clothes if you list them.
+
+---
+
 # Build an app for Pippa
 
 You have about two hours. At the end of it, a program you built will be running
